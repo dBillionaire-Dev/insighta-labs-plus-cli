@@ -9,7 +9,6 @@ import { saveCredentials, isLoggedIn } from "../utils/credentials";
 
 const API_URL: string = process.env.INSIGHTA_API_URL || "http://localhost:3000";
 const CLI_CALLBACK_PORT = 9876;
-const CLI_CALLBACK_URL = `http://localhost:${CLI_CALLBACK_PORT}/callback`;
 
 export function registerLoginCommand(program: Command): void {
     program
@@ -23,9 +22,8 @@ export function registerLoginCommand(program: Command): void {
 
             const codeVerifier = generateCodeVerifier();
             const codeChallenge = generateCodeChallenge(codeVerifier);
-            const state = generateState();
+            const state = "cli_" + generateState(); // prefix marks this as CLI flow
 
-            // Build GitHub OAuth URL via backend
             const authUrl =
                 `${API_URL}/auth/github?` +
                 `code_challenge=${codeChallenge}&` +
@@ -36,7 +34,10 @@ export function registerLoginCommand(program: Command): void {
             console.log(chalk.gray("If the browser doesn't open, visit this URL manually:"));
             console.log(chalk.underline(authUrl));
 
-            // Spin up a local server to catch the OAuth callback
+            // Timeout handle
+            let timeoutHandle: NodeJS.Timeout;
+
+            // Spin up local server to catch the OAuth callback redirect
             const server = http.createServer(async (req, res): Promise<void> => {
                 if (!req.url?.startsWith("/callback")) return;
 
@@ -44,61 +45,67 @@ export function registerLoginCommand(program: Command): void {
                 const code = url.searchParams.get("code");
                 const returnedState = url.searchParams.get("state");
 
-                // Close the browser tab
+                // Close browser tab immediately
                 res.writeHead(200, { "Content-Type": "text/html" });
                 res.end(`
-          <html><body style="font-family:sans-serif;text-align:center;padding:40px">
-            <h2>Login successful!</h2>
-            <p>You can close this tab and return to your terminal.</p>
-          </body></html>
-    `);
-            server.close();
+          <html>
+            <body style="font-family:sans-serif;text-align:center;padding:40px">
+              <h2>✅ Login successful!</h2>
+              <p>You can close this tab and return to your terminal.</p>
+            </body>
+          </html>
+        `);
 
-            if (!code) {
-                console.error(chalk.red("\n✖ OAuth callback missing code. Login failed."));
-                process.exit(1);
-            }
+                // Stop server and timeout AFTER response is sent
+                clearTimeout(timeoutHandle);
+                server.close();
 
-            if (returnedState !== state) {
-                console.error(chalk.red("\n✖ State mismatch. Possible CSRF attack. Login aborted."));
-                process.exit(1);
-            }
+                if (!code) {
+                    console.error(chalk.red("\n✖ OAuth callback missing code. Login failed."));
+                    process.exit(1);
+                }
 
-            const spinner = ora("Exchanging code for tokens...").start();
+                if (returnedState !== state) {
+                    console.error(chalk.red("\n✖ State mismatch. Possible CSRF attack. Login aborted."));
+                    process.exit(1);
+                }
 
-            try {
-                // Send code + code_verifier to backend callback
-                const callbackUrl =
-                    `${API_URL}/auth/github/callback?` +
-                    `code=${code}&` +
-                    `state=${state}&` +
-                    `code_verifier=${codeVerifier}`;
+                const spinner = ora("Exchanging code for tokens...").start();
 
-                const tokenRes = await axios.get(callbackUrl);
-                const { access_token, refresh_token, user } = tokenRes.data;
+                try {
+                    // Call backend callback directly with code + code_verifier
+                    const tokenRes = await axios.get(`${API_URL}/auth/github/callback`, {
+                        params: {
+                            code,
+                            state,
+                            code_verifier: codeVerifier,
+                        },
+                    });
 
-                saveCredentials({ access_token, refresh_token, user });
+                    const { access_token, refresh_token, user } = tokenRes.data;
 
-                spinner.succeed(chalk.green("Login successful!"));
-                console.log(chalk.cyan(`\nWelcome, ${user.username}! Role: ${chalk.bold(user.role)}`));
-            } catch (err: any) {
-                spinner.fail("Login failed");
-                console.error(chalk.red(err.response?.data?.message || err.message));
-                process.exit(1);
-            }
-        });
+                    saveCredentials({ access_token, refresh_token, user });
 
-        server.listen(CLI_CALLBACK_PORT, (): void => {
-            open(authUrl).catch((): void => {
-                console.log(chalk.yellow("Could not open browser automatically. Please visit the URL above."));
+                    spinner.succeed(chalk.green("Login successful!"));
+                    console.log(chalk.cyan(`\nWelcome, ${user.username}! Role: ${chalk.bold(user.role)}`));
+                } catch (err: any) {
+                    spinner.fail("Login failed");
+                    console.error(chalk.red(err.response?.data?.message || err.message));
+                    process.exit(1);
+                }
             });
-        });
 
-        // Timeout after 2 minutes
-        setTimeout((): void => {
-            server.close();
-            console.error(chalk.red("\n✖ Login timed out after 2 minutes."));
-            process.exit(1);
-        }, 2 * 60 * 1000);
-    });
+            server.listen(CLI_CALLBACK_PORT, (): void => {
+                open(authUrl).catch((): void => {
+                    console.log(chalk.yellow("Could not open browser automatically. Please visit the URL above."));
+                });
+            });
+
+            // Timeout after 2 minutes
+            timeoutHandle = setTimeout((): void => {
+                server.close();
+                console.error(chalk.red("\n✖ Login timed out after 2 minutes."));
+                process.exit(1);
+            }, 2 * 60 * 1000);
+        });
 }
